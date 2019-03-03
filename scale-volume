@@ -1,0 +1,204 @@
+#!/bin/bash
+
+# Check config
+
+check_config() {
+	# Regular expression that only matches numbers
+	local _RE_NUMBERS="^[0-9]*$"
+	local CONFIG_CHECK=0
+
+	if ! [[ "${SCALE_AT}" =~ ${_RE_NUMBERS} ]]; then
+		echo "Environment variable SCALE_AT is not a number. (${SCALE_AT})"
+		unset SCALE_AT
+	fi
+	if [[ -z "${SCALE_AT}" ]]; then
+		echo "Environment variable SCALE_AT must be set to a number of bytes. It is the minimum space available on the drive before it scales."
+		CONFIG_CHECK=1
+	fi
+
+	if ! [[ "${SCALE_UP_BY}" =~ ${_RE_NUMBERS} ]]; then
+		echo "Environment variable SCALE_UP_BY is not a number. (${SCALE_UP_BY})"
+		unset SCALE_UP_BY
+	fi
+	if [[ -z "${SCALE_UP_BY}" ]]; then
+		echo "Environment variable SCALE_UP_BY must be set to a number of bytes. It is the number of bytes to increase the drive size by."
+		CONFIG_CHECK=1
+	fi
+
+	if [[ -z "${TARGET_VOLUME_ID}" ]]; then
+		echo "Environment variable TARGET_VOLUME_ID must be set to an EBS volume ID. It is the device that will be scaled up."
+		CONFIG_CHECK=1
+	fi
+
+	if [[ "${TARGET_SHOULD_CONVERT_ST1}" != "" && $TARGET_SHOULD_CONVERT_ST1 -ne 0 && $TARGET_SHOULD_CONVERT_ST1 -ne 1 ]]; then
+		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 must be blank, 0, or 1. It is currently \"${TARGET_SHOULD_CONVERT_ST1}\"."
+		CONFIG_CHECK=1
+	fi
+	if [[ -z "${TARGET_SHOULD_CONVERT_ST1}" ]]; then
+		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 is not set. Assuming 0. It should be set to 1 if the volume should be converted to magnetic when eligible or 0 if no conversion should happen."
+		TARGET_SHOULD_CONVERT_ST1=0
+	fi
+
+	if [[ -z "${TARGET_FS_MOUNTPOINT}" ]]; then
+		echo "Environment variable TARGET_FS_MOUNTPOINT must be set to the mountpoint of the volume being scaled."
+		CONFIG_CHECK=1
+	fi
+
+	if [[ $CONFIG_CHECK -ne 0 ]]; then
+		exit $CONFIG_CHECK
+	fi
+
+	return 0
+}
+
+START_TIME="$(date "+%F %T")"
+
+CONFIG_FILE="$1"
+if ! [[ -z "$CONFIG_FILE" ]]; then
+	CONFIG_FILE="/etc/scale-volumes/${CONFIG_FILE}.conf"
+	if ! [[ -r "$CONFIG_FILE" ]]; then
+		echo "Unable to read configuration: ${CONFIG_FILE}"
+		exit 2
+	fi
+
+	. "${CONFIG_FILE}"
+fi
+unset CONFIG_FILE
+
+check_config
+
+EXIT_STATUS=0
+
+_TMP_MOUNTPOINT="$(stat --format="%m" "${TARGET_FS_MOUNTPOINT}" 2>/dev/null)"
+_TMP_MOUNTPOINT_STATUS=$?
+if [[ $_TMP_MOUNTPOINT_STATUS -ne 0 || "${_TMP_MOUNTPOINT}" != "${TARGET_FS_MOUNTPOINT}" ]]; then
+	echo "Filesystem ${TARGET_FS_MOUNTPOINT} is not mounted" >&2
+	exit 2
+fi
+unset _TMP_MOUNTPOINT _TMP_MOUNTPOINT_STATUS
+
+TARGET_FS_DEVICE="$(awk -vmountpoint="${TARGET_FS_MOUNTPOINT}" '$2==mountpoint{ print $1 }' /proc/mounts)"
+if [[ -z "${TARGET_FS_DEVICE}" ]]; then
+	echo "Unable to detect device for filesystem ${TARGET_FS_MOUNTPOINT}" >&2
+	exit 2
+fi
+
+SHOULD_GROWPART=0
+TARGET_DEV="/dev/$(lsblk -no pkname "${TARGET_FS_DEVICE}")"
+if [[ "${TARGET_DEV}" != "/dev/" ]]; then
+	_PARTITION_NUM_PATH="/sys/class/block/$(basename "${TARGET_FS_DEVICE}")/partition"
+	if [[ -r "${_PARTITION_NUM_PATH}" ]]; then
+		SHOULD_GROWPART=1
+		TARGET_PARTITION="$(cat "${_PARTITION_NUM_PATH}")"
+	fi
+	unset _PARTITION_NUM_PATH
+else
+	unset TARGET_DEV
+fi
+
+if [[ $SHOULD_GROWPART -eq 1 ]]; then
+	growpart "${TARGET_DEV}" "${TARGET_PARTITION}" >/dev/null
+	_GROWPART_STATUS=$?
+	if [[ $_GROWPART_STATUS -eq 0 ]]; then
+		echo "WARNING: Partition was not using all available space." >&2
+		EXIT_STATUS=1
+	fi
+	if [[ $_GROWPART_STATUS -eq 2 ]]; then
+		echo "ERROR: growpart reported a failure."
+		exit 2
+	fi
+	unset _GROWPART_STATUS
+fi
+
+if ! resize2fs "${TARGET_FS_DEVICE}" 2>&1 | grep -Fqs "is already"; then
+	echo "WARNING: Filesystem was not using the full partition." >&2
+	EXIT_STATUS=1
+fi
+
+FREE_BYTES=$(($(stat -f --format="%a*%S" "${TARGET_FS_MOUNTPOINT}")))
+FREE_GIB=$((FREE_BYTES / 1024 / 1024 / 1024))
+
+SCALE_AT_GIB=$((SCALE_AT / 1024 / 1024 / 1024))
+
+if ! [[ $FREE_BYTES -lt $SCALE_AT ]]; then
+	echo "Enough free space (${FREE_GIB} GiB) is available. We don't scale until ${SCALE_AT_GIB} GiB."
+	exit $EXIT_STATUS
+fi
+
+echo "Running low on space. Only ${FREE_GIB} GiB free. We scale up at ${SCALE_AT_GIB} GiB."
+
+PARTITION_SIZE_BYTES=$(lsblk -b -o size "${TARGET_FS_DEVICE}" | tail -1)
+NEW_SIZE_BYTES=$((PARTITION_SIZE_BYTES + SCALE_UP_BY))
+NEW_SIZE_GIB=$(((NEW_SIZE_BYTES / 1024 / 1024 / 1024) + 1))
+
+VOLUME_TYPE_ARGS=()
+
+if [[ $VOLUME_SHOULD_CONVERT_ST1 -eq 1 ]]; then
+	if [[ $NEW_SIZE_GIB -gt 500 || $NEW_SIZE_GIB -eq 500 ]]; then
+		VOLUME_TYPE="$(aws ec2 describe-volumes --volume-ids "${TARGET_VOLUME_ID}" --output text --query 'Volumes[0].VolumeType')"
+		if [[ -z "${VOLUME_TYPE}" ]]; then
+			echo "ERROR: Could not get current volume type."
+			exit 2
+		fi
+		if [[ "${VOLUME_TYPE}" != "st1" ]]; then
+			echo "Changing volume type to st1"
+			VOLUME_TYPE_ARGS+=("--volume-type" "st1")
+		fi
+		unset VOLUME_TYPE
+	fi
+fi
+
+echo "Growing EBS volume to ${NEW_SIZE_GIB} GiB."
+
+if ! aws ec2 modify-volume --output text --volume-id "${TARGET_VOLUME_ID}" --size "${NEW_SIZE_GIB}" "${VOLUME_TYPE_ARGS[@]}"; then
+	echo "ERROR: Failed to change size of EBS volume." >&2
+	exit 2
+fi
+
+echo "Successfully grew EBS volume."
+
+if [[ $SHOULD_GROWPART -eq 1 ]]; then
+	growpart "${TARGET_DEV}" "${TARGET_PARTITION}" >/dev/null
+	GROWPART_STATUS=$?
+	while [[ $GROWPART_STATUS -eq 1 ]]; do
+		# Loop until growpart grows the partition
+		sleep 1
+		growpart "${TARGET_DEV}" "${TARGET_PARTITION}" >/dev/null
+		GROWPART_STATUS=$?
+	done
+	if [[ $GROWPART_STATUS -ne 0 ]]; then
+		echo "ERROR: growpart exited with status ${GROWPART_STATUS}"
+		exit 2
+	fi
+
+	echo "Successfully grew partition."
+fi
+
+resize2fs "${TARGET_FS_DEVICE}" 2>&1 | grep -Fqs "is already"
+RESIZE_STATUS=${PIPESTATUS[0]}
+GREP_STATUS=${PIPESTATUS[1]}
+while [[ $RESIZE_STATUS -eq 0 && $GREP_STATUS -eq 0 ]]; do
+	# Loop until resize2fs does something
+	sleep 1
+	resize2fs "${TARGET_FS_DEVICE}" 2>&1 | grep -Fqs "is already"
+	RESIZE_STATUS=${PIPESTATUS[0]}
+	GREP_STATUS=${PIPESTATUS[1]}
+done
+if [[ $RESIZE_STATUS -ne 0 ]]; then
+	echo "ERROR: resize2fs exited with status ${RESIZE_STATUS}"
+	exit 2
+fi
+
+echo "Successfully grew filesystem."
+
+NEW_SIZE_BYTES=$(($(stat -f --format="%b*%S" "${TARGET_FS_MOUNTPOINT}")))
+NEW_SIZE_GIB=$((NEW_SIZE_BYTES / 1024 / 1024 / 1024))
+
+NEW_FREE_BYTES=$(($(stat -f --format="%a*%S" "${TARGET_FS_MOUNTPOINT}")))
+NEW_FREE_GIB=$((NEW_FREE_BYTES / 1024 / 1024 / 1024))
+
+echo "Scale up operation successful."
+echo "New filesystem size: ${NEW_SIZE_GIB} GiB"
+echo "Free space: ${NEW_FREE_GIB} GiB"
+
+(printf "Scaling success:\n\n"; journalctl -u scale-media-volume.service --since "${START_TIME}") | mail -s "$(hostname -s): ${TARGET_FS_MOUNTPOINT} scaled" hostmaster@johnson.computer

@@ -1,0 +1,11 @@
+[Unit]
+Description=Minutely volume scaling check
+
+[Timer]
+Unit=scale-volume@%i.service
+OnCalendar=minutely
+RandomizedDelaySec=45s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

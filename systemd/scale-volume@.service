@@ -1,0 +1,9 @@
+[Unit]
+Description=Scale boot volume
+ConditionACPower=true
+OnFailure=service-failed@scale-volume@%i.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/scale-volumes/%i.conf
+ExecStart=/opt/scale-volume
