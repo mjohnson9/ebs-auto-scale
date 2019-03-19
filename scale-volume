@@ -30,16 +30,21 @@ check_config() {
 		CONFIG_CHECK=1
 	fi
 
-	if [[ "${TARGET_SHOULD_CONVERT_ST1}" != "" && $TARGET_SHOULD_CONVERT_ST1 -ne 0 && $TARGET_SHOULD_CONVERT_ST1 -ne 1 ]]; then
-		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 must be blank, 0, or 1. It is currently \"${TARGET_SHOULD_CONVERT_ST1}\"."
+	if [[ "${TARGET_SHOULD_CONVERT_ST1}" != "" && $TARGET_SHOULD_CONVERT_ST1 -ne 0 && $TARGET_SHOULD_CONVERT_ST1 -ne 1 && $TARGET_SHOULD_CONVERT_ST1 -ne 2 ]]; then
+		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 must be blank, 0, 1, or 2. It is currently \"${TARGET_SHOULD_CONVERT_ST1}\"."
 		CONFIG_CHECK=1
 	fi
 	if [[ -z "${TARGET_SHOULD_CONVERT_ST1}" ]]; then
-		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 is not set. Assuming 0. It should be set to 1 if the volume should be converted to magnetic when eligible or 0 if no conversion should happen."
+		echo "Environment variable TARGET_SHOULD_CONVERT_ST1 is not set. Assuming 0. It should be set to 1 if the volume should be converted to magnetic when eligible, 2 if the volume should be converted when cost effective, or 0 if no conversion should happen."
 		TARGET_SHOULD_CONVERT_ST1=0
 	fi
 
 	if [[ -z "${TARGET_FS_MOUNTPOINT}" ]]; then
+		echo "Environment variable TARGET_FS_MOUNTPOINT must be set to the mountpoint of the volume being scaled."
+		CONFIG_CHECK=1
+	fi
+
+	if [[ -z "${NOTIFICATION_EMAIL}" ]]; then
 		echo "Environment variable TARGET_FS_MOUNTPOINT must be set to the mountpoint of the volume being scaled."
 		CONFIG_CHECK=1
 	fi
@@ -52,18 +57,6 @@ check_config() {
 }
 
 START_TIME="$(date "+%F %T")"
-
-CONFIG_FILE="$1"
-if ! [[ -z "$CONFIG_FILE" ]]; then
-	CONFIG_FILE="/etc/scale-volumes/${CONFIG_FILE}.conf"
-	if ! [[ -r "$CONFIG_FILE" ]]; then
-		echo "Unable to read configuration: ${CONFIG_FILE}"
-		exit 2
-	fi
-
-	. "${CONFIG_FILE}"
-fi
-unset CONFIG_FILE
 
 check_config
 
@@ -127,14 +120,34 @@ fi
 
 echo "Running low on space. Only ${FREE_GIB} GiB free. We scale up at ${SCALE_AT_GIB} GiB."
 
+VOLUME_MODIFICATION_STATE="$(aws ec2 describe-volumes-modifications --volume-ids ${TARGET_VOLUME_ID} | jq -r '.VolumesModifications[0].ModificationState')"
+_DESCRIBE_VOLUME_STATUS=$?
+if [[ $_DESCRIBE_VOLUME_STATUS -ne 0 ]]; then
+	echo "ERROR: Failed to get volume modification status" >&2
+	exit 2
+fi
+unset _DESCRIBE_VOLUME_STATUS
+
+if [[ "${VOLUME_MODIFICATION_STATE}" != "completed" ]]; then
+	echo "Stil in ${VOLUME_MODIFICATION_STATE} state from last modification. Cannot modify this volume."
+	exit 0
+fi
+
 PARTITION_SIZE_BYTES=$(lsblk -b -o size "${TARGET_FS_DEVICE}" | tail -1)
 NEW_SIZE_BYTES=$((PARTITION_SIZE_BYTES + SCALE_UP_BY))
 NEW_SIZE_GIB=$(((NEW_SIZE_BYTES / 1024 / 1024 / 1024) + 1))
 
 VOLUME_TYPE_ARGS=()
 
-if [[ $VOLUME_SHOULD_CONVERT_ST1 -eq 1 ]]; then
-	if [[ $NEW_SIZE_GIB -gt 500 || $NEW_SIZE_GIB -eq 500 ]]; then
+if [[ $VOLUME_SHOULD_CONVERT_ST1 -eq 1 || $VOLUME_SHOULD_CONVERT_ST1 -eq 2 ]]; then
+	ST1_TARGET_SIZE=500
+	if [[ $VOLUME_SHOULD_CONVERT_ST1 -eq 2 ]]; then
+		# 500GiB is the minimum ST1 size
+		# 500GiB*$0.045/GiB = $22.50
+		# $22.50/($0.10/GiB) = 225GiB
+		ST1_TARGET_SIZE=225
+	fi
+	if [[ $NEW_SIZE_GIB -gt $ST1_TARGET_SIZE || $NEW_SIZE_GIB -eq $ST1_TARGET_SIZE ]]; then
 		VOLUME_TYPE="$(aws ec2 describe-volumes --volume-ids "${TARGET_VOLUME_ID}" --output text --query 'Volumes[0].VolumeType')"
 		if [[ -z "${VOLUME_TYPE}" ]]; then
 			echo "ERROR: Could not get current volume type."
@@ -174,20 +187,28 @@ if [[ $SHOULD_GROWPART -eq 1 ]]; then
 	echo "Successfully grew partition."
 fi
 
+echo "Attempting resize2fs..."
 resize2fs "${TARGET_FS_DEVICE}" 2>&1 | grep -Fqs "is already"
+GREP_STATUS=$?
 RESIZE_STATUS=${PIPESTATUS[0]}
-GREP_STATUS=${PIPESTATUS[1]}
+echo "Resize status: $RESIZE_STATUS"
+echo "grep status: $GREP_STATUS"
 while [[ $RESIZE_STATUS -eq 0 && $GREP_STATUS -eq 0 ]]; do
 	# Loop until resize2fs does something
 	sleep 1
+	echo "Attempting resize2fs..."
 	resize2fs "${TARGET_FS_DEVICE}" 2>&1 | grep -Fqs "is already"
+	GREP_STATUS=$?
 	RESIZE_STATUS=${PIPESTATUS[0]}
-	GREP_STATUS=${PIPESTATUS[1]}
+	echo "Resize status: $RESIZE_STATUS"
+	echo "grep status: $GREP_STATUS"
 done
 if [[ $RESIZE_STATUS -ne 0 ]]; then
 	echo "ERROR: resize2fs exited with status ${RESIZE_STATUS}"
 	exit 2
 fi
+unset RESIZE_STATUS
+unset GREP_STATUS
 
 echo "Successfully grew filesystem."
 
@@ -201,4 +222,4 @@ echo "Scale up operation successful."
 echo "New filesystem size: ${NEW_SIZE_GIB} GiB"
 echo "Free space: ${NEW_FREE_GIB} GiB"
 
-(printf "Scaling success:\n\n"; journalctl -u scale-media-volume.service --since "${START_TIME}") | mail -s "$(hostname -s): ${TARGET_FS_MOUNTPOINT} scaled" hostmaster@johnson.computer
+(printf "Scaling success:\n\n"; journalctl -u scale-media-volume.service --since "${START_TIME}") | mail -s "$(hostname -s): ${TARGET_FS_MOUNTPOINT} scaled" "${NOTIFICATION_EMAIL}"
