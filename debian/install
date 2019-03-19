@@ -1,4 +1,4 @@
-scale-volume usr/libexec
+scale-volume usr/lib
 example.conf etc/scale-volumes
 systemd/scale-volume@.service lib/systemd/system
 systemd/scale-volume@.timer lib/systemd/system

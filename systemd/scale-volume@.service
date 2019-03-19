@@ -4,4 +4,4 @@ Description=Scale boot volume
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/scale-volumes/%i.conf
-ExecStart=/usr/libexec/scale-volume
+ExecStart=/usr/lib/scale-volume
