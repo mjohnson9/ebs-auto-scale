@@ -1,8 +1,7 @@
 [Unit]
 Description=Scale boot volume
-ConditionACPower=true
 
 [Service]
 Type=oneshot
 EnvironmentFile=/etc/scale-volumes/%i.conf
-ExecStart=/opt/scale-volume
+ExecStart=/usr/libexec/scale-volume
