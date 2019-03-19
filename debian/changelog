@@ -1,3 +1,9 @@
+ebs-auto-scale (1.0.1-1) bionic; urgency=medium
+
+  * Upstream fixes to systemd files
+
+ -- Michael Johnson <michael@johnson.computer>  Tue, 19 Mar 2019 16:04:26 +0000
+
 ebs-auto-scale (1.0.0-1) unstable; urgency=medium
 
   * Initial release
