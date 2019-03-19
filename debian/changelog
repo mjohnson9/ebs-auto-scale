@@ -1,3 +1,9 @@
+ebs-auto-scale (1.0.2-1) bionic; urgency=medium
+
+  * refactor(binary location): lintian doesn't like usr/libexec, use usr/lib instead
+
+ -- Michael Johnson <michael@johnson.computer>  Tue, 19 Mar 2019 16:15:17 +0000
+
 ebs-auto-scale (1.0.1-1) bionic; urgency=medium
 
   * Upstream fixes to systemd files
