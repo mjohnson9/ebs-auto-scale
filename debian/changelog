@@ -1,0 +1,5 @@
+ebs-auto-scale (1.0.0-1) unstable; urgency=medium
+
+  * Initial release
+
+ -- Michael Johnson <michael@johnson.computer>  Tue, 19 Mar 2019 15:21:38 +0000

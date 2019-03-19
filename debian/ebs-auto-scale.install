@@ -1,0 +1,4 @@
+scale-volume usr/sbin
+example.conf etc/scale-volumes
+systemd/scale-volume@.service lib/systemd/system
+systemd/scale-volume@.timer lib/systemd/system

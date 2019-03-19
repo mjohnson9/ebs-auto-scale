@@ -1,0 +1,15 @@
+Source: ebs-auto-scale
+Section: admin
+Priority: optional
+Maintainer: Michael Johnson <michael@johnson.computer>
+Build-Depends: debhelper (>= 10)
+Standards-Version: 4.1.2
+Homepage: https://github.com/nightexcessive/ebs-auto-scale/
+#Vcs-Git: https://anonscm.debian.org/git/collab-maint/ebs-auto-scale.git
+#Vcs-Browser: https://anonscm.debian.org/cgit/collab-maint/ebs-auto-scale.git
+
+Package: ebs-auto-scale
+Architecture: all
+Depends: awscli, bash
+Description: automatically scale EBS volumes
+ Automatically scale EBS volumes based on a space left, as configured by the user.
