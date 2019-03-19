@@ -120,7 +120,7 @@ fi
 
 echo "Running low on space. Only ${FREE_GIB} GiB free. We scale up at ${SCALE_AT_GIB} GiB."
 
-VOLUME_MODIFICATION_STATE="$(aws ec2 describe-volumes-modifications --volume-ids ${TARGET_VOLUME_ID} | jq -r '.VolumesModifications[0].ModificationState')"
+VOLUME_MODIFICATION_STATE="$(aws ec2 describe-volumes-modifications --volume-ids "${TARGET_VOLUME_ID}" | jq -r '.VolumesModifications[0].ModificationState')"
 _DESCRIBE_VOLUME_STATUS=$?
 if [[ $_DESCRIBE_VOLUME_STATUS -ne 0 ]]; then
 	echo "ERROR: Failed to get volume modification status" >&2
